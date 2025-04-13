@@ -1,5 +1,5 @@
 ```
-# Exemple de configuration pour ESP-IDF 5.1.5
+# Exemple de configuration pour ESP-IDF 5.1.5 (simplifiée)
 esphome:
   name: esp32-file-server
   friendly_name: ESP32 File Server
@@ -13,7 +13,7 @@ esp32:
   board: esp32-s3-box-3
   framework:
     type: esp-idf
-    version: 5.1.0  # Version compatible avec ESP-IDF 5.1.5
+    version: 5.1.0  # Compatible avec ESP-IDF 5.1.5
   
   # Options importantes pour les gros fichiers
   flash_size: 16MB  
@@ -34,24 +34,18 @@ external_components:
   - source: local
     components: [ftp_http_proxy]
 
-# Configuration FTP-HTTP Proxy
+# Configuration FTP-HTTP Proxy simplifiée
 ftp_http_proxy:
   id: file_proxy
   ftp_server: "192.168.1.10"  # Votre serveur FTP
   username: "ftpuser"         # Votre nom d'utilisateur FTP
   password: "ftppass"         # Votre mot de passe FTP
   local_port: 8080            # Port HTTP sur l'ESP
-  remote_paths:
-    - "musique/chanson1.mp3"
-    - "musique/chanson2.mp3"
-    - "documents/important.pdf"
-  shareable_files:
-    - "musique/chanson1.mp3"
-    - "documents/important.pdf"
 
 # Affichage des logs
 logger:
   level: INFO
   logs:
     ftp_proxy: DEBUG
+
 ```
