@@ -34,12 +34,14 @@ static const char* HTML_INDEX = R"(
         .btn { padding: 6px 12px; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 14px; }
         .download-btn { background: #4CAF50; color: white; border: none; }
         .share-btn { background: #2196F3; color: white; border: none; }
+        .toggle-btn { background: #FF9800; color: white; border: none; }
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; }
         .modal-content { background: white; padding: 20px; border-radius: 5px; width: 90%; max-width: 500px; }
         .close-btn { float: right; cursor: pointer; font-size: 20px; }
         .share-link { padding: 10px; background: #f5f5f5; border-radius: 4px; word-break: break-all; margin: 10px 0; }
         .copy-btn { background: #673AB7; color: white; border: none; padding: 5px 10px; cursor: pointer; border-radius: 4px; }
         .success-msg { color: green; display: none; }
+        .shareable-badge { display: inline-block; background: #4CAF50; color: white; font-size: 10px; padding: 3px 6px; border-radius: 3px; margin-left: 5px; }
     </style>
 </head>
 <body>
@@ -77,6 +79,13 @@ static const char* HTML_INDEX = R"(
                         nameDiv.className = 'file-name';
                         nameDiv.textContent = file.name;
                         
+                        if (file.shareable) {
+                            const badge = document.createElement('span');
+                            badge.className = 'shareable-badge';
+                            badge.textContent = 'Partageable';
+                            nameDiv.appendChild(badge);
+                        }
+                        
                         const actionsDiv = document.createElement('div');
                         actionsDiv.className = 'file-actions';
                         
@@ -84,15 +93,23 @@ static const char* HTML_INDEX = R"(
                         downloadBtn.className = 'btn download-btn';
                         downloadBtn.textContent = 'Télécharger';
                         downloadBtn.href = '/' + file.path;
-                        
-                        const shareBtn = document.createElement('button');
-                        shareBtn.className = 'btn share-btn';
-                        shareBtn.textContent = 'Partager';
-                        shareBtn.onclick = () => createShareLink(file.path);
-                        
                         actionsDiv.appendChild(downloadBtn);
-                        if (file.shareable) {
-                            actionsDiv.appendChild(shareBtn);
+                        
+                        // Bouton de partage uniquement pour les fichiers
+                        if (file.type === 'file') {
+                            const toggleBtn = document.createElement('button');
+                            toggleBtn.className = 'btn toggle-btn';
+                            toggleBtn.textContent = file.shareable ? 'Ne pas partager' : 'Rendre partageable';
+                            toggleBtn.onclick = () => toggleShareable(file.path, !file.shareable);
+                            actionsDiv.appendChild(toggleBtn);
+                            
+                            if (file.shareable) {
+                                const shareBtn = document.createElement('button');
+                                shareBtn.className = 'btn share-btn';
+                                shareBtn.textContent = 'Partager';
+                                shareBtn.onclick = () => createShareLink(file.path);
+                                actionsDiv.appendChild(shareBtn);
+                            }
                         }
                         
                         li.appendChild(nameDiv);
@@ -101,6 +118,23 @@ static const char* HTML_INDEX = R"(
                     });
                 })
                 .catch(error => console.error('Erreur lors du chargement des fichiers:', error));
+        }
+        
+        // Activer/Désactiver le partage d'un fichier
+        function toggleShareable(path, shareable) {
+            fetch('/api/toggle-shareable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: path, shareable: shareable })
+            })
+            .then(response => {
+                if (response.ok) {
+                    loadFiles(); // Recharger la liste des fichiers
+                } else {
+                    console.error('Erreur lors du changement de statut de partage');
+                }
+            })
+            .catch(error => console.error('Erreur:', error));
         }
         
         // Créer un lien de partage
@@ -187,10 +221,22 @@ void FTPHTTPProxy::loop() {
 }
 
 bool FTPHTTPProxy::is_shareable(const std::string &path) {
-  return std::find(shareable_files_.begin(), shareable_files_.end(), path) != shareable_files_.end();
+  // Rechercher le fichier dans notre liste
+  for (const auto &file : ftp_files_) {
+    if (file.path == path) {
+      return file.shareable;
+    }
+  }
+  return false;
 }
 
 void FTPHTTPProxy::create_share_link(const std::string &path, int expiry_hours) {
+  // Vérifier si le fichier est partageable
+  if (!is_shareable(path)) {
+    ESP_LOGW(TAG, "Tentative de partage d'un fichier non partageable: %s", path.c_str());
+    return;
+  }
+  
   // Générer un token aléatoire
   uint32_t random_value = esp_random();
   char token[16];
@@ -616,6 +662,9 @@ bool FTPHTTPProxy::list_ftp_directory(const std::string &remote_dir, httpd_req_t
   char *saveptr;
   char *line = strtok_r(entry_buffer, "\r\n", &saveptr);
   
+  // Vider notre liste de fichiers et la reconstruire
+  ftp_files_.clear();
+  
   while (line) {
     // Analyser le listing FTP (format typique: "drwxr-xr-x 1 owner group size date filename")
     char perms[11] = {0};
@@ -631,29 +680,35 @@ bool FTPHTTPProxy::list_ftp_directory(const std::string &remote_dir, httpd_req_t
       if (strcmp(filename, ".") != 0 && strcmp(filename, "..") != 0) {
         bool is_dir = (perms[0] == 'd');
         
-        // Vérifier si c'est un chemin configurable
-        bool found = false;
-        for (const auto &path : remote_paths_) {
-          if (path == filename || path.find(std::string(filename) + "/") == 0) {
-            found = true;
+        // Vérifier si on connaît déjà ce fichier
+        bool known_file = false;
+        bool is_shareable = false;
+        
+        for (const auto &file : ftp_files_) {
+          if (file.path == filename) {
+            known_file = true;
+            is_shareable = file.shareable;
             break;
           }
         }
         
-        if (found) {
-          // Vérifier si le fichier est partageable
-          bool shareable = is_shareable(filename);
-          
-          if (!first_file) file_list += ",";
-          first_file = false;
-          
-          // Ajouter l'entrée à la liste JSON
-          file_list += "{\"name\":\"" + std::string(filename) + "\",";
-          file_list += "\"path\":\"" + std::string(filename) + "\",";
-          file_list += "\"type\":\"" + std::string(is_dir ? "directory" : "file") + "\",";
-          file_list += "\"size\":" + std::to_string(size) + ",";
-          file_list += "\"shareable\":" + std::string(shareable ? "true" : "false") + "}";
+        // Si c'est un nouveau fichier, l'ajouter à notre liste
+        if (!known_file) {
+          FileEntry entry;
+          entry.path = filename;
+          entry.shareable = false; // Non partageable par défaut
+          ftp_files_.push_back(entry);
         }
+        
+        if (!first_file) file_list += ",";
+        first_file = false;
+        
+        // Ajouter l'entrée à la liste JSON
+        file_list += "{\"name\":\"" + std::string(filename) + "\",";
+        file_list += "\"path\":\"" + std::string(filename) + "\",";
+        file_list += "\"type\":\"" + std::string(is_dir ? "directory" : "file") + "\",";
+        file_list += "\"size\":" + std::to_string(size) + ",";
+        file_list += "\"shareable\":" + std::string(is_shareable ? "true" : "false") + "}";
       }
     }
     
@@ -677,6 +732,66 @@ bool FTPHTTPProxy::list_ftp_directory(const std::string &remote_dir, httpd_req_t
   return true;
 }
 
+esp_err_t FTPHTTPProxy::toggle_shareable_handler(httpd_req_t *req) {
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  
+  // Lire le corps de la requête JSON
+  char content[256];
+  int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+  if (ret <= 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Données JSON manquantes");
+    return ESP_FAIL;
+  }
+  content[ret] = '\0';
+  
+  // Analyser le JSON (implémentation basique)
+  // Format attendu: {"path": "chemin/du/fichier", "shareable": true|false}
+  std::string path;
+  bool shareable = false;
+  
+  char *token = strtok(content, "{},:\"");
+  while (token) {
+    if (strcmp(token, "path") == 0) {
+      token = strtok(NULL, "{},:\"");
+      if (token) path = token;
+    } else if (strcmp(token, "shareable") == 0) {
+      token = strtok(NULL, "{},:\"");
+      if (token) shareable = (strcmp(token, "true") == 0);
+    }
+    token = strtok(NULL, "{},:\"");
+  }
+  
+  if (path.empty()) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Chemin de fichier manquant");
+    return ESP_FAIL;
+  }
+  
+  // Mettre à jour notre liste de fichiers
+  bool found = false;
+  for (auto &file : proxy->ftp_files_) {
+    if (file.path == path) {
+      file.shareable = shareable;
+      found = true;
+      break;
+    }
+  }
+  
+  if (!found) {
+    // Ajouter un nouveau fichier
+    FileEntry entry;
+    entry.path = path;
+    entry.shareable = shareable;
+    proxy->ftp_files_.push_back(entry);
+  }
+  
+  ESP_LOGI(TAG, "Fichier %s marqué comme %s", 
+           path.c_str(), shareable ? "partageable" : "non partageable");
+  
+  // Réponse simple
+  httpd_resp_sendstr(req, shareable ? "Fichier partageable" : "Fichier non partageable");
+  return ESP_OK;
+}
+
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
   std::string requested_path = req->uri;
@@ -687,32 +802,27 @@ esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   }
 
   ESP_LOGI(TAG, "Requête de téléchargement reçue: %s", requested_path.c_str());
-
-  // Vérifier si le fichier est dans les chemins autorisés
-  bool path_valid = false;
-  for (const auto &configured_path : proxy->remote_paths_) {
-    if (requested_path == configured_path) {
-      path_valid = true;
-      break;
-    }
-  }
   
   // Vérifier si c'est un lien de partage valide
-  if (!path_valid) {
-    // Format typique: /share/TOKEN
-    if (requested_path.compare(0, 6, "share/") == 0) {
-      std::string token = requested_path.substr(6);
-      
-      // Chercher le token dans les partages actifs
-      for (const auto &share : proxy->active_shares_) {
-        if (share.token == token) {
-          requested_path = share.path;
-          path_valid = true;
-          ESP_LOGI(TAG, "Accès via lien de partage: %s -> %s", token.c_str(), requested_path.c_str());
-          break;
-        }
+  bool path_valid = false;
+  
+  // Format typique: /share/TOKEN
+  if (requested_path.compare(0, 6, "share/") == 0) {
+    std::string token = requested_path.substr(6);
+    
+    // Chercher le token dans les partages actifs
+    for (const auto &share : proxy->active_shares_) {
+      if (share.token == token) {
+        requested_path = share.path;
+        path_valid = true;
+        ESP_LOGI(TAG, "Accès via lien de partage: %s -> %s", token.c_str(), requested_path.c_str());
+        break;
       }
     }
+  } else {
+    // Vérifier si le fichier est dans la liste des fichiers connus
+    // Tous les fichiers connus sont accessibles directement (pas besoin d'une liste prédéfinie)
+    path_valid = true;
   }
   
   if (!path_valid) {
@@ -922,6 +1032,15 @@ void FTPHTTPProxy::setup_http_server() {
   };
   ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_files_api));
   
+  // Gestionnaire pour activer/désactiver le partage
+  httpd_uri_t uri_toggle_shareable = {
+    .uri       = "/api/toggle-shareable",
+    .method    = HTTP_POST,
+    .handler   = toggle_shareable_handler,
+    .user_ctx  = this
+  };
+  ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_toggle_shareable));
+  
   // Gestionnaire pour la création de liens de partage
   httpd_uri_t uri_share_api = {
     .uri       = "/api/share",
@@ -955,6 +1074,7 @@ void FTPHTTPProxy::setup_http_server() {
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
+
 
 
 
