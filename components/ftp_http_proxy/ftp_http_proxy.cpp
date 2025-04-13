@@ -357,11 +357,16 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   size_t bytes_since_last_wdt = 0;
   
   // Allouer le buffer en SPIRAM pour les gros fichiers
-  // Vérifier la présence de PSRAM
-  bool has_psram = esp_psram_is_initialized();
+  // Vérifier la présence de PSRAM avec une méthode compatible ESP-IDF 5.1.5
+  bool has_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 0;
   const int buffer_size = 8192;  // Taille optimisée pour l'ESP32-S3
-  char* buffer;
+
+  // Préparation des structures et variables en dehors des goto pour éviter les erreurs de saut
+  std::string extension = "";
+  char* buffer = nullptr;
+  FTPHTTPProxy proxy_instance;
   
+  // Allocation du buffer avec PSRAM si disponible
   if (has_psram) {
     buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
     ESP_LOGI(TAG, "Utilisation de la PSRAM pour le buffer");
@@ -372,59 +377,60 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   
   if (!buffer) {
     ESP_LOGE(TAG, "Échec d'allocation pour le buffer");
-    goto cleanup;
+    goto end_task;
   }
 
   // Connexion au serveur FTP
-  if (!connect_to_ftp(ftp_sock, ctx->ftp_server.c_str(), ctx->username.c_str(), ctx->password.c_str())) {
+  if (!proxy_instance.connect_to_ftp(ftp_sock, ctx->ftp_server.c_str(), ctx->username.c_str(), ctx->password.c_str())) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
-    goto cleanup;
+    goto end_task;
   }
 
   // Réinitialiser le watchdog régulièrement
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
 
   // Détecter si c'est un fichier média pour le type MIME approprié
-  std::string extension = "";
-  size_t dot_pos = ctx->remote_path.find_last_of('.');
-  if (dot_pos != std::string::npos) {
-    extension = ctx->remote_path.substr(dot_pos);
-    std::transform(extension.begin(), extension.end(), extension.begin(), 
-                  [](unsigned char c){ return std::tolower(c); });
-  }
+  {
+    size_t dot_pos = ctx->remote_path.find_last_of('.');
+    if (dot_pos != std::string::npos) {
+      extension = ctx->remote_path.substr(dot_pos);
+      std::transform(extension.begin(), extension.end(), extension.begin(), 
+                    [](unsigned char c){ return std::tolower(c); });
+    }
 
-  // Configuration des headers HTTP appropriés
-  if (extension == ".mp3") {
-    httpd_resp_set_type(ctx->req, "audio/mpeg");
-  } else if (extension == ".wav") {
-    httpd_resp_set_type(ctx->req, "audio/wav");
-  } else if (extension == ".ogg") {
-    httpd_resp_set_type(ctx->req, "audio/ogg");
-  } else if (extension == ".mp4") {
-    httpd_resp_set_type(ctx->req, "video/mp4");
-  } else if (extension == ".pdf") {
-    httpd_resp_set_type(ctx->req, "application/pdf");
-  } else if (extension == ".jpg" || extension == ".jpeg") {
-    httpd_resp_set_type(ctx->req, "image/jpeg");
-  } else if (extension == ".png") {
-    httpd_resp_set_type(ctx->req, "image/png");
-  } else {
-    // Type par défaut pour les fichiers inconnus
-    httpd_resp_set_type(ctx->req, "application/octet-stream");
-    
-    // Extraire le nom du fichier pour Content-Disposition
-    std::string filename = ctx->remote_path;
-    size_t slash_pos = ctx->remote_path.find_last_of('/');
-    if (slash_pos != std::string::npos) {
-      filename = ctx->remote_path.substr(slash_pos + 1);
+    // Configuration des headers HTTP appropriés
+    if (extension == ".mp3") {
+      httpd_resp_set_type(ctx->req, "audio/mpeg");
+    } else if (extension == ".wav") {
+      httpd_resp_set_type(ctx->req, "audio/wav");
+    } else if (extension == ".ogg") {
+      httpd_resp_set_type(ctx->req, "audio/ogg");
+    } else if (extension == ".mp4") {
+      httpd_resp_set_type(ctx->req, "video/mp4");
+    } else if (extension == ".pdf") {
+      httpd_resp_set_type(ctx->req, "application/pdf");
+    } else if (extension == ".jpg" || extension == ".jpeg") {
+      httpd_resp_set_type(ctx->req, "image/jpeg");
+    } else if (extension == ".png") {
+      httpd_resp_set_type(ctx->req, "image/png");
+    } else {
+      // Type par défaut pour les fichiers inconnus
+      httpd_resp_set_type(ctx->req, "application/octet-stream");
+      
+      // Extraire le nom du fichier pour Content-Disposition
+      std::string filename = ctx->remote_path;
+      size_t slash_pos = ctx->remote_path.find_last_of('/');
+      if (slash_pos != std::string::npos) {
+        filename = ctx->remote_path.substr(slash_pos + 1);
+      }
+      
+      std::string header = "attachment; filename=\"" + filename + "\"";
+      httpd_resp_set_hdr(ctx->req, "Content-Disposition", header.c_str());
     }
     
-    std::string header = "attachment; filename=\"" + filename + "\"";
-    httpd_resp_set_hdr(ctx->req, "Content-Disposition", header.c_str());
+    // En-têtes pour permettre la mise en cache et les requêtes par plage
+    httpd_resp_set_hdr(ctx->req, "Accept-Ranges", "bytes");
   }
-  
-  // En-têtes pour permettre la mise en cache et les requêtes par plage
-  httpd_resp_set_hdr(ctx->req, "Accept-Ranges", "bytes");
 
   // Réinitialiser le watchdog avant le mode passif
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
@@ -434,7 +440,7 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
-    goto cleanup;
+    goto end_task;
   }
   buffer[bytes_received] = '\0';
   ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
@@ -442,7 +448,7 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   pasv_start = strchr(buffer, '(');
   if (!pasv_start) {
     ESP_LOGE(TAG, "Format PASV incorrect");
-    goto cleanup;
+    goto end_task;
   }
   sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
   data_port = port[0] * 256 + port[1];
@@ -451,7 +457,7 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   data_sock = socket(AF_INET, SOCK_STREAM, 0);
   if (data_sock < 0) {
     ESP_LOGE(TAG, "Échec de création du socket de données");
-    goto cleanup;
+    goto end_task;
   }
 
   // Configuration du socket de données
@@ -459,18 +465,20 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
   // Timeout pour les opérations socket
-  struct timeval data_timeout = {.tv_sec = 10, .tv_usec = 0};
-  setsockopt(data_sock, SOL_SOCKET, SO_RCVTIMEO, &data_timeout, sizeof(data_timeout));
+  {
+    struct timeval data_timeout = {.tv_sec = 10, .tv_usec = 0};
+    setsockopt(data_sock, SOL_SOCKET, SO_RCVTIMEO, &data_timeout, sizeof(data_timeout));
 
-  struct sockaddr_in data_addr;
-  memset(&data_addr, 0, sizeof(data_addr));
-  data_addr.sin_family = AF_INET;
-  data_addr.sin_port = htons(data_port);
-  data_addr.sin_addr.s_addr = htonl((ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]);
+    struct sockaddr_in data_addr;
+    memset(&data_addr, 0, sizeof(data_addr));
+    data_addr.sin_family = AF_INET;
+    data_addr.sin_port = htons(data_port);
+    data_addr.sin_addr.s_addr = htonl((ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]);
 
-  if (connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
-    ESP_LOGE(TAG, "Échec de connexion au port de données");
-    goto cleanup;
+    if (connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
+      ESP_LOGE(TAG, "Échec de connexion au port de données");
+      goto end_task;
+    }
   }
 
   // Réinitialiser le watchdog avant l'envoi de RETR
@@ -483,7 +491,7 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
-    goto cleanup;
+    goto end_task;
   }
   buffer[bytes_received] = '\0';
   
@@ -513,7 +521,7 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
     esp_err_t err = httpd_resp_send_chunk(ctx->req, buffer, bytes_received);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
-      goto cleanup;
+      break;
     }
     
     // Journalisation périodique pour suivre la progression
@@ -526,8 +534,10 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   }
 
   // Fermeture correcte de la connexion de données
-  close(data_sock);
-  data_sock = -1;
+  if (data_sock != -1) {
+    close(data_sock);
+    data_sock = -1;
+  }
 
   // Réinitialiser le watchdog avant la fin
   ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
@@ -542,7 +552,7 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
     ESP_LOGW(TAG, "Fin de transfert incomplète ou inattendue");
   }
 
-cleanup:
+end_task:
   // Nettoyage des ressources
   if (buffer) {
     if (has_psram) {
