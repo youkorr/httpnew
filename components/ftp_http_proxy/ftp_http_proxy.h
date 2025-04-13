@@ -1,45 +1,66 @@
 #pragma once
 
-#include "esphome.h"
-#include <vector>
-#include <string>
+#include "esphome/core/component.h"
 #include <esp_http_server.h>
-#include <lwip/sockets.h>
+#include <string>
+#include <vector>
 
 namespace esphome {
 namespace ftp_http_proxy {
+
+struct FileTransferContext {
+  std::string remote_path;
+  httpd_req_t* req;
+  std::string ftp_server;
+  std::string username;
+  std::string password;
+};
 
 class FTPHTTPProxy : public Component {
  public:
   void set_ftp_server(const std::string &server) { ftp_server_ = server; }
   void set_username(const std::string &username) { username_ = username; }
   void set_password(const std::string &password) { password_ = password; }
+  void set_local_port(int port) { local_port_ = port; }
   void add_remote_path(const std::string &path) { remote_paths_.push_back(path); }
-  void set_local_port(uint16_t port) { local_port_ = port; }
-
+  void add_shareable_file(const std::string &path) { shareable_files_.push_back(path); }
+  
+  bool is_shareable(const std::string &path);
+  void create_share_link(const std::string &path, int expiry_hours);
+  
   void setup() override;
   void loop() override;
-  float get_setup_priority() const override { return esphome::setup_priority::AFTER_WIFI; }
-
-  // Point d'entrée public pour démarrer un téléchargement
-  bool download_file(const std::string &remote_path, httpd_req_t *req);
 
  protected:
+  static esp_err_t http_req_handler(httpd_req_t *req);
+  static esp_err_t file_list_handler(httpd_req_t *req);
+  static esp_err_t share_create_handler(httpd_req_t *req);
+  static esp_err_t share_access_handler(httpd_req_t *req);
+  static esp_err_t static_files_handler(httpd_req_t *req);
+  
+  void setup_http_server();
+  static void file_transfer_task(void* param);
+  bool connect_to_ftp(int& sock, const char* server, const char* username, const char* password);
+  bool list_ftp_directory(const std::string &remote_dir, httpd_req_t *req);
+
   std::string ftp_server_;
   std::string username_;
   std::string password_;
-  std::vector<std::string> remote_paths_;
-  uint16_t local_port_{8000};
-  httpd_handle_t server_{nullptr};
+  int local_port_{8080};
   int sock_{-1};
-  int ftp_port_ = 21;
-  bool send_ftp_command(const std::string &cmd, std::string &response);
-
-  bool connect_to_ftp();
-  bool download_file_impl(const std::string &remote_path, httpd_req_t *req);
-  void setup_http_server();
-  static esp_err_t http_req_handler(httpd_req_t *req);
+  httpd_handle_t server_{nullptr};
+  std::vector<std::string> remote_paths_;
+  
+  // Structure pour le partage de fichiers
+  struct ShareLink {
+    std::string path;
+    std::string token;
+    int64_t expiry;  // Changé en int64_t pour ESP-IDF
+  };
+  std::vector<std::string> shareable_files_;
+  std::vector<ShareLink> active_shares_;
 };
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
+
