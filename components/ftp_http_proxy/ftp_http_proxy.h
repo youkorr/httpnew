@@ -28,6 +28,7 @@ class FTPHTTPProxy : public Component {
   
   void setup() override;
   void loop() override;
+  void setup_http_server();
 
  protected:
   static esp_err_t http_req_handler(httpd_req_t *req);
@@ -37,7 +38,6 @@ class FTPHTTPProxy : public Component {
   static esp_err_t static_files_handler(httpd_req_t *req);
   static esp_err_t toggle_shareable_handler(httpd_req_t *req);
   
-  void setup_http_server();
   static void file_transfer_task(void* param);
   bool connect_to_ftp(int& sock, const char* server, const char* username, const char* password);
   bool list_ftp_directory(const std::string &remote_dir, httpd_req_t *req);
@@ -48,6 +48,7 @@ class FTPHTTPProxy : public Component {
   int local_port_{8080};
   int sock_{-1};
   httpd_handle_t server_{nullptr};
+  bool delayed_setup_{false};
   
   // Structure pour le partage de fichiers
   struct ShareLink {
@@ -68,5 +69,6 @@ class FTPHTTPProxy : public Component {
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
+
 
 
