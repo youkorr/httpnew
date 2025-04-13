@@ -17,7 +17,7 @@
 static const char *TAG = "ftp_proxy";
 
 // Interface HTML pour le navigateur de fichiers (inclus comme chaîne)
-static const char* HTML_INDEX = R"(
+static const char* HTML_INDEX = R"=====(
 <!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -185,7 +185,7 @@ static const char* HTML_INDEX = R"(
     </script>
 </body>
 </html>
-)";
+)=====";
 
 namespace esphome {
 namespace ftp_http_proxy {
@@ -1074,6 +1074,7 @@ void FTPHTTPProxy::setup_http_server() {
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
+
 
 
 
