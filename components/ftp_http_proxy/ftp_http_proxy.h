@@ -22,8 +22,6 @@ class FTPHTTPProxy : public Component {
   void set_username(const std::string &username) { username_ = username; }
   void set_password(const std::string &password) { password_ = password; }
   void set_local_port(int port) { local_port_ = port; }
-  void add_remote_path(const std::string &path) { remote_paths_.push_back(path); }
-  void add_shareable_file(const std::string &path) { shareable_files_.push_back(path); }
   
   bool is_shareable(const std::string &path);
   void create_share_link(const std::string &path, int expiry_hours);
@@ -37,6 +35,7 @@ class FTPHTTPProxy : public Component {
   static esp_err_t share_create_handler(httpd_req_t *req);
   static esp_err_t share_access_handler(httpd_req_t *req);
   static esp_err_t static_files_handler(httpd_req_t *req);
+  static esp_err_t toggle_shareable_handler(httpd_req_t *req);
   
   void setup_http_server();
   static void file_transfer_task(void* param);
@@ -49,18 +48,25 @@ class FTPHTTPProxy : public Component {
   int local_port_{8080};
   int sock_{-1};
   httpd_handle_t server_{nullptr};
-  std::vector<std::string> remote_paths_;
   
   // Structure pour le partage de fichiers
   struct ShareLink {
     std::string path;
     std::string token;
-    int64_t expiry;  // Changé en int64_t pour ESP-IDF
+    int64_t expiry;  // Timestamp d'expiration
   };
-  std::vector<std::string> shareable_files_;
+  
+  struct FileEntry {
+    std::string path;
+    bool shareable;
+  };
+  
+  // Stockage des fichiers et paramètres de partage en mémoire
+  std::vector<FileEntry> ftp_files_;
   std::vector<ShareLink> active_shares_;
 };
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
+
 
