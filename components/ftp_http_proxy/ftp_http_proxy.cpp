@@ -13,6 +13,7 @@
 #include <string>
 #include "esp_timer.h"
 #include "esp_check.h"
+#include "esp_wifi.h"
 
 static const char *TAG = "ftp_proxy";
 
@@ -193,21 +194,25 @@ namespace ftp_http_proxy {
 void FTPHTTPProxy::setup() {
   ESP_LOGI(TAG, "Initialisation du proxy FTP/HTTP avec ESP-IDF 5.1.5");
 
-  // Configuration du watchdog avec délai généreux pour ESP-IDF 5.1.5
-  esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = 30000,  // 30 secondes
-    .idle_core_mask = 0,
-    .trigger_panic = true
-  };
-  
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_init(&wdt_config));
-  ESP_LOGI(TAG, "Watchdog configuré avec timeout de 30s");
-  
-  // Démarrage du serveur HTTP
-  this->setup_http_server();
+  // Ne pas essayer de réinitialiser le watchdog, utiliser celui déjà configuré
+  // Planifier le démarrage du serveur HTTP après un délai pour que le WiFi et LWIP soient prêts
+  delayed_setup_ = true;
 }
 
 void FTPHTTPProxy::loop() {
+  // Premier passage dans loop: initialiser le serveur HTTP
+  if (delayed_setup_) {
+    static uint8_t startup_counter = 0;
+    startup_counter++;
+    
+    // Attendre 5 passages dans loop pour s'assurer que tout est prêt
+    if (startup_counter >= 5) {
+      delayed_setup_ = false;
+      this->setup_http_server();
+    }
+    return;
+  }
+
   // Nettoyage des liens de partage expirés
   int64_t now = esp_timer_get_time() / 1000000; // Temps en secondes
   active_shares_.erase(
@@ -338,35 +343,18 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
     return;
   }
   
-  // Enregistrer la tâche avec le WDT (ESP-IDF 5.1.5)
-  TaskHandle_t task_handle = xTaskGetCurrentTaskHandle();
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_add(task_handle));
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
-  
   ESP_LOGI(TAG, "Démarrage du transfert pour %s", ctx->remote_path.c_str());
   
+  FTPHTTPProxy proxy_instance;
   int ftp_sock = -1;
   int data_sock = -1;
-  char *pasv_start = nullptr;
-  int data_port = 0;
-  int ip[4], port[2];
-  int bytes_received;
-  int flag = 1;
-  int rcvbuf = 32768;
-  size_t total_bytes_transferred = 0;
-  size_t bytes_since_last_wdt = 0;
-  
-  // Allouer le buffer en SPIRAM pour les gros fichiers
-  // Vérifier la présence de PSRAM avec une méthode compatible ESP-IDF 5.1.5
+  bool success = false;
+
+  // Allocation du buffer avec PSRAM si disponible
   bool has_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 0;
   const int buffer_size = 8192;  // Taille optimisée pour l'ESP32-S3
-
-  // Préparation des structures et variables en dehors des goto pour éviter les erreurs de saut
-  std::string extension = "";
   char* buffer = nullptr;
-  FTPHTTPProxy proxy_instance;
   
-  // Allocation du buffer avec PSRAM si disponible
   if (has_psram) {
     buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
     ESP_LOGI(TAG, "Utilisation de la PSRAM pour le buffer");
@@ -377,28 +365,26 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   
   if (!buffer) {
     ESP_LOGE(TAG, "Échec d'allocation pour le buffer");
-    goto end_task;
+    goto end_transfer;
   }
 
   // Connexion au serveur FTP
   if (!proxy_instance.connect_to_ftp(ftp_sock, ctx->ftp_server.c_str(), ctx->username.c_str(), ctx->password.c_str())) {
     ESP_LOGE(TAG, "Échec de connexion FTP");
-    goto end_task;
+    goto end_transfer;
   }
 
-  // Réinitialiser le watchdog régulièrement
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
-
-  // Détecter si c'est un fichier média pour le type MIME approprié
+  // Configuration des headers HTTP
   {
+    std::string extension = "";
     size_t dot_pos = ctx->remote_path.find_last_of('.');
     if (dot_pos != std::string::npos) {
       extension = ctx->remote_path.substr(dot_pos);
       std::transform(extension.begin(), extension.end(), extension.begin(), 
-                    [](unsigned char c){ return std::tolower(c); });
+                     [](unsigned char c){ return std::tolower(c); });
     }
 
-    // Configuration des headers HTTP appropriés
+    // Configuration du type MIME
     if (extension == ".mp3") {
       httpd_resp_set_type(ctx->req, "audio/mpeg");
     } else if (extension == ".wav") {
@@ -432,57 +418,54 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
     httpd_resp_set_hdr(ctx->req, "Accept-Ranges", "bytes");
   }
 
-  // Réinitialiser le watchdog avant le mode passif
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
-
   // Mode passif
   send(ftp_sock, "PASV\r\n", 6, 0);
-  bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
+  int bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
-    goto end_task;
+    goto end_transfer;
   }
   buffer[bytes_received] = '\0';
-  ESP_LOGD(TAG, "Réponse PASV: %s", buffer);
 
-  pasv_start = strchr(buffer, '(');
-  if (!pasv_start) {
-    ESP_LOGE(TAG, "Format PASV incorrect");
-    goto end_task;
-  }
-  sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
-  data_port = port[0] * 256 + port[1];
-  ESP_LOGD(TAG, "Port de données: %d", data_port);
-
-  data_sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (data_sock < 0) {
-    ESP_LOGE(TAG, "Échec de création du socket de données");
-    goto end_task;
-  }
-
-  // Configuration du socket de données
-  setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
-  setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
-  // Timeout pour les opérations socket
+  // Analyse de la réponse PASV
   {
+    char *pasv_start = strchr(buffer, '(');
+    if (!pasv_start) {
+      ESP_LOGE(TAG, "Format PASV incorrect");
+      goto end_transfer;
+    }
+    
+    int ip[4], port[2];
+    sscanf(pasv_start, "(%d,%d,%d,%d,%d,%d)", &ip[0], &ip[1], &ip[2], &ip[3], &port[0], &port[1]);
+    int data_port = port[0] * 256 + port[1];
+    
+    // Connexion au port de données
+    data_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (data_sock < 0) {
+      ESP_LOGE(TAG, "Échec de création du socket de données");
+      goto end_transfer;
+    }
+    
+    int flag = 1;
+    setsockopt(data_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    
+    int rcvbuf = 32768;
+    setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    
     struct timeval data_timeout = {.tv_sec = 10, .tv_usec = 0};
     setsockopt(data_sock, SOL_SOCKET, SO_RCVTIMEO, &data_timeout, sizeof(data_timeout));
-
+    
     struct sockaddr_in data_addr;
     memset(&data_addr, 0, sizeof(data_addr));
     data_addr.sin_family = AF_INET;
     data_addr.sin_port = htons(data_port);
     data_addr.sin_addr.s_addr = htonl((ip[0] << 24) | (ip[1] << 16) | (ip[2] << 8) | ip[3]);
-
+    
     if (connect(data_sock, (struct sockaddr *)&data_addr, sizeof(data_addr)) != 0) {
-      ESP_LOGE(TAG, "Échec de connexion au port de données");
-      goto end_task;
+      ESP_LOGE(TAG, "Échec de connexion au port de données: %d", errno);
+      goto end_transfer;
     }
   }
-
-  // Réinitialiser le watchdog avant l'envoi de RETR
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
 
   // Envoyer la commande RETR pour récupérer le fichier
   snprintf(buffer, buffer_size, "RETR %s\r\n", ctx->remote_path.c_str());
@@ -491,68 +474,62 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "150 ")) {
     ESP_LOGE(TAG, "Fichier non trouvé ou inaccessible");
-    goto end_task;
+    goto end_transfer;
   }
-  buffer[bytes_received] = '\0';
   
   ESP_LOGI(TAG, "Téléchargement du fichier %s démarré", ctx->remote_path.c_str());
 
   // Boucle principale de transfert de données
-  while (true) {
-    // Réinitialiser le watchdog régulièrement pendant le transfert
-    bytes_since_last_wdt += buffer_size;
-    if (bytes_since_last_wdt > 102400) { // Reset WDT tous les 100KB environ
-      ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
-      bytes_since_last_wdt = 0;
-    }
+  {
+    size_t total_bytes_transferred = 0;
     
-    bytes_received = recv(data_sock, buffer, buffer_size, 0);
-    if (bytes_received <= 0) {
-      if (bytes_received < 0) {
-        ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
+    while (true) {
+      bytes_received = recv(data_sock, buffer, buffer_size, 0);
+      if (bytes_received <= 0) {
+        if (bytes_received < 0) {
+          ESP_LOGE(TAG, "Erreur de réception des données: %d", errno);
+        }
+        break;
       }
-      break;
+      
+      // Mise à jour du total transféré
+      total_bytes_transferred += bytes_received;
+      
+      // Envoi du chunk au client HTTP
+      esp_err_t err = httpd_resp_send_chunk(ctx->req, buffer, bytes_received);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
+        goto end_transfer;
+      }
+      
+      // Journalisation périodique pour suivre la progression
+      if (total_bytes_transferred % (1024 * 1024) == 0) { // Log tous les 1MB
+        ESP_LOGI(TAG, "Transfert en cours: %zu MB", total_bytes_transferred / (1024 * 1024));
+      }
+      
+      // Yield pour permettre à d'autres tâches de s'exécuter
+      vTaskDelay(pdMS_TO_TICKS(1));
     }
     
-    // Mise à jour du total transféré
-    total_bytes_transferred += bytes_received;
-    
-    // Envoi du chunk au client HTTP
-    esp_err_t err = httpd_resp_send_chunk(ctx->req, buffer, bytes_received);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Échec d'envoi au client: %d", err);
-      break;
+    // Vérifier que le transfert s'est bien terminé
+    if (data_sock != -1) {
+      close(data_sock);
+      data_sock = -1;
     }
     
-    // Journalisation périodique pour suivre la progression
-    if (total_bytes_transferred % (1024 * 1024) == 0) { // Log tous les 1MB
-      ESP_LOGI(TAG, "Transfert en cours: %zu MB", total_bytes_transferred / (1024 * 1024));
+    bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
+    if (bytes_received > 0 && strstr(buffer, "226 ")) {
+      buffer[bytes_received] = '\0';
+      ESP_LOGI(TAG, "Transfert terminé avec succès: %zu KB (%zu MB)", 
+               total_bytes_transferred / 1024,
+               total_bytes_transferred / (1024 * 1024));
+      success = true;
+    } else {
+      ESP_LOGW(TAG, "Fin de transfert incomplète ou inattendue");
     }
-    
-    // Yield pour permettre à d'autres tâches de s'exécuter
-    vTaskDelay(pdMS_TO_TICKS(1));
   }
 
-  // Fermeture correcte de la connexion de données
-  if (data_sock != -1) {
-    close(data_sock);
-    data_sock = -1;
-  }
-
-  // Réinitialiser le watchdog avant la fin
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
-
-  bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
-  if (bytes_received > 0 && strstr(buffer, "226 ")) {
-    buffer[bytes_received] = '\0';
-    ESP_LOGI(TAG, "Transfert terminé avec succès: %zu KB (%zu MB)", 
-             total_bytes_transferred / 1024,
-             total_bytes_transferred / (1024 * 1024));
-  } else {
-    ESP_LOGW(TAG, "Fin de transfert incomplète ou inattendue");
-  }
-
-end_task:
+end_transfer:
   // Nettoyage des ressources
   if (buffer) {
     if (has_psram) {
@@ -569,10 +546,11 @@ end_task:
   }
   
   // Terminer la réponse HTTP
-  httpd_resp_send_chunk(ctx->req, NULL, 0);
-  
-  // Supprimer la tâche du watchdog
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_delete(task_handle));
+  if (!success) {
+    httpd_resp_send_err(ctx->req, HTTPD_500_INTERNAL_SERVER_ERROR, "Erreur de transfert de fichier");
+  } else {
+    httpd_resp_send_chunk(ctx->req, NULL, 0);
+  }
   
   // Libérer la mémoire du contexte
   delete ctx;
@@ -672,9 +650,7 @@ bool FTPHTTPProxy::list_ftp_directory(const std::string &remote_dir, httpd_req_t
   char *saveptr;
   char *line = strtok_r(entry_buffer, "\r\n", &saveptr);
   
-  // Vider notre liste de fichiers et la reconstruire
-  ftp_files_.clear();
-  
+  // Construction de la liste de fichiers
   while (line) {
     // Analyser le listing FTP (format typique: "drwxr-xr-x 1 owner group size date filename")
     char perms[11] = {0};
@@ -1004,28 +980,37 @@ esp_err_t FTPHTTPProxy::static_files_handler(httpd_req_t *req) {
 }
 
 void FTPHTTPProxy::setup_http_server() {
+  ESP_LOGI(TAG, "Démarrage du serveur HTTP...");
+
+  // Vérification de la connexion réseau
+  wifi_ap_record_t ap_info;
+  if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+    ESP_LOGW(TAG, "WiFi semble ne pas être connecté, mais on continue quand même");
+  } else {
+    ESP_LOGI(TAG, "WiFi connecté à %s", ap_info.ssid);
+  }
+
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = local_port_;
   config.uri_match_fn = httpd_uri_match_wildcard;
   
   // Optimisations pour ESP-IDF 5.1.5
-  config.recv_wait_timeout = 30;      // 30 secondes (valeur plus courte pour économiser des ressources)
-  config.send_wait_timeout = 30;      // 30 secondes
+  config.recv_wait_timeout = 30;    // 30 secondes
+  config.send_wait_timeout = 30;    // 30 secondes
   config.max_uri_handlers = 8;        
   config.max_resp_headers = 16;
-  config.stack_size = 8192;           // Taille de pile suffisante
-  config.lru_purge_enable = true;     // Activer la purge LRU
-  config.core_id = 0;                 // S'exécute sur le cœur 0
+  config.stack_size = 8192;         // Taille de pile suffisante
+  config.lru_purge_enable = true;   // Activer la purge LRU
+  config.core_id = 0;               // S'exécute sur le cœur 0
   
-  ESP_LOGI(TAG, "Démarrage du serveur HTTP...");
   esp_err_t ret = httpd_start(&server_, &config);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Échec du démarrage du serveur HTTP: %s", esp_err_to_name(ret));
     return;
   }
 
-  // Gestionnaire pour l'interface web
-  httpd_uri_t uri_static = {
+  // Enregistrement des gestionnaires d'URI
+  const httpd_uri_t uri_static = {
     .uri       = "/",
     .method    = HTTP_GET,
     .handler   = static_files_handler,
@@ -1033,8 +1018,7 @@ void FTPHTTPProxy::setup_http_server() {
   };
   ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_static));
   
-  // Gestionnaire pour l'API de fichiers
-  httpd_uri_t uri_files_api = {
+  const httpd_uri_t uri_files_api = {
     .uri       = "/api/files",
     .method    = HTTP_GET,
     .handler   = file_list_handler,
@@ -1042,8 +1026,7 @@ void FTPHTTPProxy::setup_http_server() {
   };
   ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_files_api));
   
-  // Gestionnaire pour activer/désactiver le partage
-  httpd_uri_t uri_toggle_shareable = {
+  const httpd_uri_t uri_toggle_shareable = {
     .uri       = "/api/toggle-shareable",
     .method    = HTTP_POST,
     .handler   = toggle_shareable_handler,
@@ -1051,8 +1034,7 @@ void FTPHTTPProxy::setup_http_server() {
   };
   ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_toggle_shareable));
   
-  // Gestionnaire pour la création de liens de partage
-  httpd_uri_t uri_share_api = {
+  const httpd_uri_t uri_share_api = {
     .uri       = "/api/share",
     .method    = HTTP_POST,
     .handler   = share_create_handler,
@@ -1060,8 +1042,7 @@ void FTPHTTPProxy::setup_http_server() {
   };
   ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_share_api));
   
-  // Gestionnaire pour l'accès via lien de partage
-  httpd_uri_t uri_share_access = {
+  const httpd_uri_t uri_share_access = {
     .uri       = "/share/*",
     .method    = HTTP_GET,
     .handler   = share_access_handler,
@@ -1069,8 +1050,7 @@ void FTPHTTPProxy::setup_http_server() {
   };
   ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_share_access));
   
-  // Gestionnaire pour le téléchargement de fichiers (wildcard)
-  httpd_uri_t uri_download = {
+  const httpd_uri_t uri_download = {
     .uri       = "/*",
     .method    = HTTP_GET,
     .handler   = http_req_handler,
@@ -1078,12 +1058,13 @@ void FTPHTTPProxy::setup_http_server() {
   };
   ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_download));
 
-  ESP_LOGI(TAG, "Serveur HTTP démarré sur le port %d", local_port_);
+  ESP_LOGI(TAG, "Serveur HTTP démarré avec succès sur le port %d", local_port_);
   ESP_LOGI(TAG, "Interface utilisateur accessible à http://[ip-esp]:%d/", local_port_);
 }
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
+
 
 
 
