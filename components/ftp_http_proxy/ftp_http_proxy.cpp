@@ -667,16 +667,30 @@ end_transfer:
 esp_err_t FTPHTTPProxy::file_list_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
   
-  // Set JSON response type
-  httpd_resp_set_type(req, "application/json");
+  // Extraire le chemin du répertoire depuis la requête (éventuellement)
+  std::string dir_path = "";
+  char *query = NULL;
+  size_t query_len = httpd_req_get_url_query_len(req) + 1;
   
-  // List files from the FTP server and send as JSON
-  // This is a placeholder - you'll need to implement the actual FTP directory listing logic
-  std::string file_list = "[";
-  // ... code to populate file_list from FTP server or from proxy->ftp_files_
-  file_list += "]";
+  if (query_len > 1) {
+    query = (char*)malloc(query_len);
+    if (httpd_req_get_url_query_str(req, query, query_len) == ESP_OK) {
+      char param[32];
+      if (httpd_query_key_value(query, "dir", param, sizeof(param)) == ESP_OK) {
+        dir_path = param;
+      }
+    }
+    free(query);
+  }
   
-  httpd_resp_send(req, file_list.c_str(), file_list.length());
+  ESP_LOGI(TAG, "Requête de liste de fichiers pour le répertoire: %s", 
+          dir_path.empty() ? "racine" : dir_path.c_str());
+  
+  if (!proxy->list_ftp_directory(dir_path, req)) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Échec de la récupération de la liste de fichiers");
+    return ESP_FAIL;
+  }
+  
   return ESP_OK;
 }
 
