@@ -335,116 +335,116 @@ bool FTPHTTPProxy::connect_to_ftp(int& sock, const char* server, const char* use
 }
 
 /* Cette fonction exécute le transfert de fichier dans une tâche séparée */
-void FTPHTTPProxy::file_transfer_task(void* param) {
-  FileTransferContext* ctx = (FileTransferContext*)param;
-  if (!ctx) {
-    ESP_LOGE(TAG, "Contexte de transfert invalide");
-    vTaskDelete(NULL);
-    return;
-  }
-
-  ESP_LOGI(TAG, "Démarrage du transfert pour %s", ctx->remote_path.c_str());
-
-  FTPHTTPProxy proxy_instance;
-  int ftp_sock = -1;
-  int data_sock = -1;
-  bool success = false;
-  int bytes_received = 0;  // Important : doit être défini ici pour éviter le problème de goto
-
-  // Allocation du buffer avec PSRAM si disponible
-  bool has_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 0;
-  const int buffer_size = 8192;
-  char* buffer = nullptr;
-
-  if (has_psram) {
-    buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
-    ESP_LOGI(TAG, "Utilisation de la PSRAM pour le buffer");
-  } else {
-    buffer = (char*)malloc(buffer_size);
-    ESP_LOGI(TAG, "PSRAM non disponible, utilisation de la RAM standard");
-  }
-
-  if (!buffer) {
-    ESP_LOGE(TAG, "Échec d'allocation pour le buffer");
-    goto end_transfer;
-  }
-
-  // Connexion FTP
-  if (!proxy_instance.connect_to_ftp(ftp_sock, ctx->ftp_server.c_str(), ctx->username.c_str(), ctx->password.c_str())) {
-    ESP_LOGE(TAG, "Échec de connexion FTP");
-    goto end_transfer;
-  }
-
-  // Préparation de l'extension de fichier
-  std::string extension = "";
-  size_t dot_pos = ctx->remote_path.find_last_of('.');
-  if (dot_pos != std::string::npos) {
-    extension = ctx->remote_path.substr(dot_pos);
-    std::transform(extension.begin(), extension.end(), extension.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-  }
-
-  // Ouverture de la connexion de données
-  if (!proxy_instance.open_data_connection(ftp_sock, data_sock, ctx->remote_path.c_str())) {
-    ESP_LOGE(TAG, "Impossible d'ouvrir la connexion de données FTP");
-    goto end_transfer;
-  }
-
-  // Envoi des en-têtes HTTP
-  if (ctx->client && ctx->client->connected()) {
-    ctx->client->println("HTTP/1.1 200 OK");
-    ctx->client->println("Content-Type: application/octet-stream");
-    ctx->client->println("Connection: close");
-    ctx->client->println();
-  }
-
-  // Transfert des données du FTP vers le client HTTP
-  while (ctx->client && ctx->client->connected()) {
-    bytes_received = recv(data_sock, buffer, buffer_size, 0);
-    if (bytes_received <= 0) break;
-
-    if (ctx->client->write((const uint8_t*)buffer, bytes_received) != bytes_received) {
-      ESP_LOGW(TAG, "Erreur d'envoi vers le client HTTP");
-      break;
+    void FTPHTTPProxy::file_transfer_task(void* param) {
+      FileTransferContext* ctx = (FileTransferContext*)param;
+      if (!ctx) {
+        ESP_LOGE(TAG, "Contexte de transfert invalide");
+        vTaskDelete(NULL);
+        return;
+      }
+    
+      ESP_LOGI(TAG, "Démarrage du transfert pour %s", ctx->remote_path.c_str());
+    
+      FTPHTTPProxy proxy_instance;
+      int ftp_sock = -1;
+      int data_sock = -1;
+      bool success = false;
+      int bytes_received = 0;  // Important : doit être défini ici pour éviter le problème de goto
+    
+      // Allocation du buffer avec PSRAM si disponible
+      bool has_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 0;
+      const int buffer_size = 8192;
+      char* buffer = nullptr;
+    
+      if (has_psram) {
+        buffer = (char*)heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
+        ESP_LOGI(TAG, "Utilisation de la PSRAM pour le buffer");
+      } else {
+        buffer = (char*)malloc(buffer_size);
+        ESP_LOGI(TAG, "PSRAM non disponible, utilisation de la RAM standard");
+      }
+    
+      if (!buffer) {
+        ESP_LOGE(TAG, "Échec d'allocation pour le buffer");
+        goto end_transfer;
+      }
+    
+      // Connexion FTP
+      if (!proxy_instance.connect_to_ftp(ftp_sock, ctx->ftp_server.c_str(), ctx->username.c_str(), ctx->password.c_str())) {
+        ESP_LOGE(TAG, "Échec de connexion FTP");
+        goto end_transfer;
+      }
+    
+      // Préparation de l'extension de fichier
+      std::string extension = "";
+      size_t dot_pos = ctx->remote_path.find_last_of('.');
+      if (dot_pos != std::string::npos) {
+        extension = ctx->remote_path.substr(dot_pos);
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+      }
+    
+      // Ouverture de la connexion de données
+      if (!proxy_instance.open_data_connection(ftp_sock, data_sock, ctx->remote_path.c_str())) {
+        ESP_LOGE(TAG, "Impossible d'ouvrir la connexion de données FTP");
+        goto end_transfer;
+      }
+    
+      // Envoi des en-têtes HTTP
+      if (ctx->client && ctx->client->connected()) {
+        ctx->client->println("HTTP/1.1 200 OK");
+        ctx->client->println("Content-Type: application/octet-stream");
+        ctx->client->println("Connection: close");
+        ctx->client->println();
+      }
+    
+      // Transfert des données du FTP vers le client HTTP
+      while (ctx->client && ctx->client->connected()) {
+        bytes_received = recv(data_sock, buffer, buffer_size, 0);
+        if (bytes_received <= 0) break;
+    
+        if (ctx->client->write((const uint8_t*)buffer, bytes_received) != bytes_received) {
+          ESP_LOGW(TAG, "Erreur d'envoi vers le client HTTP");
+          break;
+        }
+    
+        // Rafraîchir le watchdog
+        esp_task_wdt_reset();
+      }
+    
+      success = true;
+    
+    end_transfer:
+      // Libération des ressources
+      if (buffer) {
+        if (has_psram) {
+          heap_caps_free(buffer);
+        } else {
+          free(buffer);
+        }
+      }
+    
+      if (ftp_sock != -1) {
+        close(ftp_sock);
+      }
+    
+      if (data_sock != -1) {
+        close(data_sock);
+      }
+    
+      if (ctx->client) {
+        ctx->client->stop();
+      }
+    
+      if (success) {
+        ESP_LOGI(TAG, "Transfert terminé avec succès pour %s", ctx->remote_path.c_str());
+      } else {
+        ESP_LOGE(TAG, "Échec du transfert pour %s", ctx->remote_path.c_str());
+      }
+    
+      delete ctx;
+      vTaskDelete(NULL);
     }
-
-    // Rafraîchir le watchdog
-    esp_task_wdt_reset();
-  }
-
-  success = true;
-
-end_transfer:
-  // Libération des ressources
-  if (buffer) {
-    if (has_psram) {
-      heap_caps_free(buffer);
-    } else {
-      free(buffer);
-    }
-  }
-
-  if (ftp_sock != -1) {
-    close(ftp_sock);
-  }
-
-  if (data_sock != -1) {
-    close(data_sock);
-  }
-
-  if (ctx->client) {
-    ctx->client->stop();
-  }
-
-  if (success) {
-    ESP_LOGI(TAG, "Transfert terminé avec succès pour %s", ctx->remote_path.c_str());
-  } else {
-    ESP_LOGE(TAG, "Échec du transfert pour %s", ctx->remote_path.c_str());
-  }
-
-  delete ctx;
-  vTaskDelete(NULL);
-}
 
     // Configuration du type MIME
     if (extension == ".mp3") {
