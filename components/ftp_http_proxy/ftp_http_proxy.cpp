@@ -349,6 +349,7 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
   int ftp_sock = -1;
   int data_sock = -1;
   bool success = false;
+  int bytes_received = 0;  // Déclaration déplacée vers le début de la fonction
 
   // Allocation du buffer avec PSRAM si disponible
   bool has_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 0;
@@ -420,7 +421,7 @@ void FTPHTTPProxy::file_transfer_task(void* param) {
 
   // Mode passif
   send(ftp_sock, "PASV\r\n", 6, 0);
-  int bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
+  bytes_received = recv(ftp_sock, buffer, buffer_size - 1, 0);
   if (bytes_received <= 0 || !strstr(buffer, "227 ")) {
     ESP_LOGE(TAG, "Erreur en mode passif");
     goto end_transfer;
