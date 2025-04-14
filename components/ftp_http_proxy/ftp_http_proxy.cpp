@@ -14,6 +14,8 @@
 #include "esp_timer.h"
 #include "esp_check.h"
 #include "esp_wifi.h"
+#ifndef HTTPD_410_GONE
+#define HTTPD_410_GONE 410
 
 static const char *TAG = "ftp_proxy";
 
@@ -752,27 +754,25 @@ esp_err_t FTPHTTPProxy::share_create_handler(httpd_req_t *req) {
 esp_err_t FTPHTTPProxy::share_access_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
   std::string uri = req->uri;
-  
-  // Extract token from URI (format: /share/TOKEN)
-  if (uri.length() <= 7) { // "/share/" is 7 chars
+
+  // Vérifie que l'URI contient un token
+  if (uri.length() <= 7) {  // "/share/" fait 7 caractères
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Invalid share link");
     return ESP_FAIL;
   }
-  
-  std::string token = uri.substr(7); // Skip "/share/"
-  
-  // Find token in active shares
+
+  std::string token = uri.substr(7);  // Extrait le token après "/share/"
   std::string target_path = "";
   int64_t now = esp_timer_get_time() / 1000000;
-  
+
   for (const auto &share : proxy->active_shares_) {
     if (share.token == token) {
-      // Check if share has expired
+      // Vérifie si le lien a expiré
       if (share.expiry < now) {
         httpd_resp_send_err(req, HTTPD_410_GONE, "Share link expired");
         return ESP_FAIL;
       }
-      
+
       target_path = share.path;
       break;
     }
