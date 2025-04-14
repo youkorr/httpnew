@@ -661,7 +661,136 @@ end_transfer:
   // Supprimer cette tâche
   vTaskDelete(NULL);
 }
+esp_err_t FTPHTTPProxy::file_list_handler(httpd_req_t *req) {
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  
+  // Set JSON response type
+  httpd_resp_set_type(req, "application/json");
+  
+  // List files from the FTP server and send as JSON
+  // This is a placeholder - you'll need to implement the actual FTP directory listing logic
+  std::string file_list = "[";
+  // ... code to populate file_list from FTP server or from proxy->ftp_files_
+  file_list += "]";
+  
+  httpd_resp_send(req, file_list.c_str(), file_list.length());
+  return ESP_OK;
+}
 
+esp_err_t FTPHTTPProxy::toggle_shareable_handler(httpd_req_t *req) {
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  
+  // Get the request body (path to toggle)
+  char buf[100];
+  int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+  if (ret <= 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request");
+    return ESP_FAIL;
+  }
+  buf[ret] = '\0';
+  
+  std::string path = buf;
+  // Find the file in proxy->ftp_files_ and toggle its shareable flag
+  bool found = false;
+  for (auto &file : proxy->ftp_files_) {
+    if (file.path == path) {
+      file.shareable = !file.shareable;
+      found = true;
+      break;
+    }
+  }
+  
+  httpd_resp_set_type(req, "application/json");
+  if (found) {
+    httpd_resp_send(req, "{\"success\": true}", 16);
+  } else {
+    httpd_resp_send(req, "{\"success\": false}", 17);
+  }
+  
+  return ESP_OK;
+}
+
+esp_err_t FTPHTTPProxy::share_create_handler(httpd_req_t *req) {
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  
+  // Get request body (path and expiry)
+  char buf[100];
+  int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+  if (ret <= 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request");
+    return ESP_FAIL;
+  }
+  buf[ret] = '\0';
+  
+  // Parse JSON (in a real implementation, use a proper JSON parser)
+  std::string path = buf; // Simplified - extract path from json
+  int expiry_hours = 24;  // Default 24 hours - extract from json
+  
+  // Generate a random token
+  std::string token = ""; // Generate a random token
+  for (int i = 0; i < 8; i++) {
+    token += 'a' + (esp_random() % 26);
+  }
+  
+  // Create share link
+  int64_t expiry = esp_timer_get_time() / 1000000 + expiry_hours * 3600;
+  ShareLink share = {
+    .path = path,
+    .token = token,
+    .expiry = expiry
+  };
+  proxy->active_shares_.push_back(share);
+  
+  // Send response
+  std::string response = "{\"token\": \"" + token + "\"}";
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, response.c_str(), response.length());
+  
+  return ESP_OK;
+}
+
+esp_err_t FTPHTTPProxy::share_access_handler(httpd_req_t *req) {
+  auto *proxy = (FTPHTTPProxy *)req->user_ctx;
+  std::string uri = req->uri;
+  
+  // Extract token from URI (format: /share/TOKEN)
+  if (uri.length() <= 7) { // "/share/" is 7 chars
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Invalid share link");
+    return ESP_FAIL;
+  }
+  
+  std::string token = uri.substr(7); // Skip "/share/"
+  
+  // Find token in active shares
+  std::string target_path = "";
+  int64_t now = esp_timer_get_time() / 1000000;
+  
+  for (const auto &share : proxy->active_shares_) {
+    if (share.token == token) {
+      // Check if share has expired
+      if (share.expiry < now) {
+        httpd_resp_send_err(req, HTTPD_410_GONE, "Share link expired");
+        return ESP_FAIL;
+      }
+      
+      target_path = share.path;
+      break;
+    }
+  }
+  
+  if (target_path.empty()) {
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Share not found");
+    return ESP_FAIL;
+  }
+  
+  // Redirect to file download (reuse http_req_handler)
+  // A proper implementation would set a new URI and call http_req_handler
+  httpd_resp_set_status(req, "307 Temporary Redirect");
+  httpd_resp_set_hdr(req, "Location", target_path.c_str());
+  httpd_resp_send(req, NULL, 0);
+  
+  return ESP_OK;
+}
 // Code corrigé pour le http_req_handler
 esp_err_t FTPHTTPProxy::http_req_handler(httpd_req_t *req) {
   auto *proxy = (FTPHTTPProxy *)req->user_ctx;
