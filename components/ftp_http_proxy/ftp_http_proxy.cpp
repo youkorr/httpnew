@@ -769,6 +769,88 @@ esp_err_t FTPHTTPProxy::static_files_handler(httpd_req_t *req) {
   httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Fichier non trouvé");
   return ESP_FAIL;
 }
+void FTPHTTPProxy::setup_http_server() {
+  ESP_LOGI(TAG, "Démarrage du serveur HTTP...");
+
+  // Vérification de la connexion réseau
+  wifi_ap_record_t ap_info;
+  if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+    ESP_LOGW(TAG, "WiFi semble ne pas être connecté, mais on continue quand même");
+  } else {
+    ESP_LOGI(TAG, "WiFi connecté à %s", ap_info.ssid);
+  }
+
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = local_port_;
+  config.uri_match_fn = httpd_uri_match_wildcard;
+  
+  // Optimisations pour ESP-IDF 5.1.5
+  config.recv_wait_timeout = 30;    // 30 secondes
+  config.send_wait_timeout = 30;    // 30 secondes
+  config.max_uri_handlers = 8;        
+  config.max_resp_headers = 16;
+  config.stack_size = 8192;         // Taille de pile suffisante
+  config.lru_purge_enable = true;   // Activer la purge LRU
+  config.core_id = 0;               // S'exécute sur le cœur 0
+  
+  esp_err_t ret = httpd_start(&server_, &config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Échec du démarrage du serveur HTTP: %s", esp_err_to_name(ret));
+    return;
+  }
+
+  // Enregistrement des gestionnaires d'URI
+  const httpd_uri_t uri_static = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = static_files_handler,
+    .user_ctx  = this
+  };
+  ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_static));
+  
+  const httpd_uri_t uri_files_api = {
+    .uri       = "/api/files",
+    .method    = HTTP_GET,
+    .handler   = file_list_handler,
+    .user_ctx  = this
+  };
+  ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_files_api));
+  
+  const httpd_uri_t uri_toggle_shareable = {
+    .uri       = "/api/toggle-shareable",
+    .method    = HTTP_POST,
+    .handler   = toggle_shareable_handler,
+    .user_ctx  = this
+  };
+  ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_toggle_shareable));
+  
+  const httpd_uri_t uri_share_api = {
+    .uri       = "/api/share",
+    .method    = HTTP_POST,
+    .handler   = share_create_handler,
+    .user_ctx  = this
+  };
+  ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_share_api));
+  
+  const httpd_uri_t uri_share_access = {
+    .uri       = "/share/*",
+    .method    = HTTP_GET,
+    .handler   = share_access_handler,
+    .user_ctx  = this
+  };
+  ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_share_access));
+  
+  const httpd_uri_t uri_download = {
+    .uri       = "/*",
+    .method    = HTTP_GET,
+    .handler   = http_req_handler,
+    .user_ctx  = this
+  };
+  ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(server_, &uri_download));
+
+  ESP_LOGI(TAG, "Serveur HTTP démarré avec succès sur le port %d", local_port_);
+  ESP_LOGI(TAG, "Interface utilisateur accessible à http://[ip-esp]:%d/", local_port_);
+}
 
 }  // namespace ftp_http_proxy
 }  // namespace esphome
