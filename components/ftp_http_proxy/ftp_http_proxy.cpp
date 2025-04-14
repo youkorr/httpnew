@@ -15,7 +15,8 @@
 #include "esp_check.h"
 #include "esp_wifi.h"
 #ifndef HTTPD_410_GONE
-#define HTTPD_410_GONE 410
+#define HTTPD_410_GONE ((httpd_err_code_t)410)
+#endif
 
 static const char *TAG = "ftp_proxy";
 
